@@ -6,6 +6,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from autopentest.storage import Storage
 from autopentest.web import create_server
@@ -66,6 +67,14 @@ class WebApiTests(unittest.TestCase):
         status, payload, _ = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["database"]["available"])
+
+    def test_health_endpoint_reports_database_failure(self) -> None:
+        with patch.object(self.storage, "connect", side_effect=RuntimeError("db down")):
+            status, payload, _ = self.request("GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["database"]["available"])
 
     def test_web_console_assets_are_served(self) -> None:
         status, body, content_type = self.request("GET", "/")
@@ -80,6 +89,11 @@ class WebApiTests(unittest.TestCase):
             f"unexpected content type: {content_type}",
         )
         self.assertIn("const state =", body)
+
+        status, body, content_type = self.request("GET", "/favicon.svg")
+        self.assertEqual(status, 200)
+        self.assertIn("image/svg+xml", content_type)
+        self.assertIn("<svg", body)
 
     def test_web_console_sets_security_headers(self) -> None:
         connection = http.client.HTTPConnection("127.0.0.1", self.app_server.server_port, timeout=10)
@@ -127,6 +141,20 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(job_payload["job"]["status"], "completed")
         self.assertGreaterEqual(job_payload["job"]["summary"]["finding_count"], 1)
+        self.assertEqual(job_payload["job"]["summary"]["scanned_target_count"], 1)
+        self.assertEqual(job_payload["job"]["summary"]["blocked_target_count"], 0)
+        self.assertEqual(job_payload["job"]["summary"]["plugin_error_count"], 0)
+
+        jobs_status, jobs_payload, _ = self.request("GET", f"/api/engagements/{engagement['id']}/jobs")
+        self.assertEqual(jobs_status, 200)
+        self.assertEqual(len(jobs_payload["items"]), 1)
+        self.assertEqual(jobs_payload["items"][0]["id"], job_payload["job"]["id"])
+
+        audit_status, audit_payload, _ = self.request("GET", f"/api/jobs/{job_payload['job']['id']}/audit-events")
+        self.assertEqual(audit_status, 200)
+        self.assertGreaterEqual(len(audit_payload["items"]), 2)
+        self.assertIn("job_started", [item["event_type"] for item in audit_payload["items"]])
+        self.assertIn("job_completed", [item["event_type"] for item in audit_payload["items"]])
 
         report_status, report_json, content_type = self.request(
             "GET",
@@ -177,6 +205,121 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(job_payload["job"]["summary"]["finding_count"], 0)
         self.assertEqual(job_payload["findings"], [])
+
+    def test_duplicate_target_returns_conflict(self) -> None:
+        demo_url = f"http://127.0.0.1:{self.target_server.server_port}"
+        status, engagement, _ = self.request(
+            "POST",
+            "/api/engagements",
+            {
+                "name": "Duplicate Target",
+                "description": "duplicate target",
+                "authorized_by": "Security Lead",
+                "ticket_id": "SEC-DUP-1",
+                "owner": "Blue Team",
+                "allowed_hosts": ["127.0.0.1"],
+                "allowed_prefixes": [],
+            },
+        )
+        self.assertEqual(status, 201)
+
+        first_status, _, _ = self.request(
+            "POST",
+            f"/api/engagements/{engagement['id']}/targets",
+            {"url": demo_url, "label": "demo-target"},
+        )
+        self.assertEqual(first_status, 201)
+
+        second_status, second_payload, _ = self.request(
+            "POST",
+            f"/api/engagements/{engagement['id']}/targets",
+            {"url": demo_url, "label": "demo-target-2"},
+        )
+        self.assertEqual(second_status, 409)
+        self.assertEqual(second_payload["error"], "同一任务下已存在相同目标 URL。")
+
+    def test_error_semantics_for_unknown_and_bad_requests(self) -> None:
+        status, payload, _ = self.request("GET", "/api/engagements/99999")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "未找到请求的资源")
+
+        status, payload, _ = self.request("GET", "/api/jobs/99999")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "未找到请求的资源")
+
+        status, payload, _ = self.request("DELETE", "/api/targets/99999")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "未找到请求的资源")
+
+        status, payload, _ = self.request("POST", "/api/engagements", {"name": "bad"})
+        self.assertEqual(status, 400)
+        self.assertIn("allowed_hosts", payload["error"])
+
+        status, payload, _ = self.request("POST", "/api/engagements/99999/jobs", {"requested_by": "tester"})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "未找到请求的资源")
+
+    def test_invalid_json_returns_bad_request(self) -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", self.app_server.server_port, timeout=10)
+        connection.request(
+            "POST",
+            "/api/engagements",
+            body=b"{not-json}",
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        connection.close()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(payload["error"], "请求体不是合法的 JSON。")
+
+    def test_unhandled_exception_returns_stable_internal_error(self) -> None:
+        with patch.object(self.storage, "list_engagements", side_effect=RuntimeError("sensitive failure")):
+            status, payload, _ = self.request("GET", "/api/engagements")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"], "服务器内部错误。")
+
+    def test_job_failure_records_job_failed_audit_event(self) -> None:
+        demo_url = f"http://127.0.0.1:{self.target_server.server_port}"
+        status, engagement, _ = self.request(
+            "POST",
+            "/api/engagements",
+            {
+                "name": "Failure Audit",
+                "description": "force failure",
+                "authorized_by": "Security Lead",
+                "ticket_id": "SEC-FAIL-1",
+                "owner": "Blue Team",
+                "allowed_hosts": ["127.0.0.1"],
+                "allowed_prefixes": [],
+            },
+        )
+        self.assertEqual(status, 201)
+
+        status, _, _ = self.request(
+            "POST",
+            f"/api/engagements/{engagement['id']}/targets",
+            {"url": demo_url, "label": "demo-target"},
+        )
+        self.assertEqual(status, 201)
+
+        with patch("autopentest.orchestrator.fetch_http_observation", side_effect=RuntimeError("boom")):
+            status, payload, _ = self.request(
+                "POST",
+                f"/api/engagements/{engagement['id']}/jobs",
+                {"requested_by": "tester"},
+            )
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"], "服务器内部错误。")
+
+        jobs_status, jobs_payload, _ = self.request("GET", f"/api/engagements/{engagement['id']}/jobs")
+        self.assertEqual(jobs_status, 200)
+        self.assertEqual(jobs_payload["items"][0]["status"], "failed")
+
+        failed_job_id = jobs_payload["items"][0]["id"]
+        audit_status, audit_payload, _ = self.request("GET", f"/api/jobs/{failed_job_id}/audit-events")
+        self.assertEqual(audit_status, 200)
+        self.assertIn("job_failed", [item["event_type"] for item in audit_payload["items"]])
 
     def test_delete_target_removes_findings_and_refreshes_job_summary(self) -> None:
         demo_url = f"http://127.0.0.1:{self.target_server.server_port}"
